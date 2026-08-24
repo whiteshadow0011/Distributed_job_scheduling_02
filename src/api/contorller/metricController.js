@@ -46,7 +46,7 @@ export async function getGlobalOverviewMetrics(req, res, next) {
     // 2. Fetch Live Redis RAM counts across all queues using a single pipeline
     const redisPipeline = redis.pipeline();
     for (const q of queues) {
-      redisPipeline.llen(`queue:${q.name}:pending`);
+      redisPipeline.zcard(`queue:${q.name}:pending`);
       redisPipeline.zcard(`queue:${q.name}:delayed`);
       redisPipeline.llen(`queue:${q.name}:dlq`);
     }
@@ -152,7 +152,7 @@ export async function getQueueMetrics(req, res, next) {
     const queue = queueResult.rows[0];
 
     const [pendingCount, delayedCount, dlqCount, activeWorkersRunning] = await Promise.all([
-      redis.llen(`queue:${queue.name}:pending`),
+      redis.zcard(`queue:${queue.name}:pending`),
       redis.zcard(`queue:${queue.name}:delayed`),
       redis.llen(`queue:${queue.name}:dlq`),
       redis.get(`queue:${queue.name}:active_count`),
@@ -264,7 +264,7 @@ export async function streamQueueMetrics(req, res) {
   const sendMetrics = async () => {
     try {
       const [pendingCount, delayedCount, dlqCount, inFlight] = await Promise.all([
-        redis.llen(`queue:${queueName}:pending`),
+        redis.zcard(`queue:${queueName}:pending`),
         redis.zcard(`queue:${queueName}:delayed`),
         redis.llen(`queue:${queueName}:dlq`),
         redis.get(`queue:${queueName}:active_count`),
