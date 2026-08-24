@@ -11,7 +11,8 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d:ro
+      - ./init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./migrations:/docker-entrypoint-initdb.d/migrations:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-scheduler_db}"]
       interval: 5s
@@ -63,11 +64,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: scheduler_worker_1
     restart: unless-stopped
     command: node src/worker/redisWorker.js
     environment:
-      QUEUE_NAME: jin-queue
       CONCURRENCY_LIMIT: 20
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/scheduler_db
       DB_HOST: postgres
