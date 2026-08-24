@@ -10,7 +10,7 @@ export async function getDLQJobs(req, res, next) {
   try {
     const { queueId } = req.params;
     const page = Math.max(1, parseInt(req.query.page || '1', 10));
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10)));
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '50', 10)));
     const offset = (page - 1) * limit;
 
     // 1. Verify queue exists
@@ -19,13 +19,12 @@ export async function getDLQJobs(req, res, next) {
       return res.status(404).json({ error: 'Queue not found.' });
     }
 
-    // 2. Fetch DLQ entries with job details
+    // 2. Fetch DLQ entries with fallback-safe ordering on jobs.created_at
     const listQuery = `
       SELECT 
         dlq.id AS dlq_id,
         dlq.job_id,
         dlq.failed_reason AS error_message,
-        dlq.exhausted_at AS moved_to_dlq_at,
         j.type AS job_type,
         j.payload,
         j.priority,
@@ -34,7 +33,7 @@ export async function getDLQJobs(req, res, next) {
       FROM dead_letter_queue dlq
       JOIN jobs j ON dlq.job_id = j.id
       WHERE dlq.queue_id = $1
-      ORDER BY dlq.exhausted_at DESC
+      ORDER BY j.created_at DESC
       LIMIT $2 OFFSET $3;
     `;
 
@@ -49,18 +48,23 @@ export async function getDLQJobs(req, res, next) {
       pool.query(countQuery, [queueId]),
     ]);
 
-    const total = parseInt(countResult.rows[0].total, 10);
+    const total = parseInt(countResult.rows[0]?.total || '0', 10);
+    const rows = itemsResult.rows || [];
 
+    // Return compatibility structures for various UI consumers
     return res.status(200).json({
-      data: itemsResult.rows,
+      data: rows,
+      dlqJobs: rows,
+      total,
       pagination: {
         total,
         page,
         limit,
-        totalPages: Math.ceil(total / limit),
+        totalPages: Math.ceil(total / limit) || 1,
       },
     });
   } catch (error) {
+    console.error('[DLQ Controller Error]:', error.message);
     next(error);
   }
 }
@@ -69,10 +73,6 @@ export async function getDLQJobs(req, res, next) {
  * POST /api/v1/queues/:queueId/dlq/replay
  * Replays dead jobs by removing them from DLQ, resetting status to QUEUED in PostgreSQL,
  * and re-injecting them into Redis RAM for immediate worker execution.
- * 
- * Request Body (optional):
- * { "jobIds": ["uuid1", "uuid2"] } -> Replays specific jobs
- * If body is empty or jobIds is omitted -> Replays all dead jobs for the queue
  */
 export async function replayDLQJobs(req, res, next) {
   const client = await pool.connect();
@@ -80,7 +80,6 @@ export async function replayDLQJobs(req, res, next) {
     const { queueId } = req.params;
     const { jobIds } = req.body || {};
 
-    // 1. Verify queue
     const queueCheck = await client.query('SELECT id, name FROM queues WHERE id = $1', [queueId]);
     if (queueCheck.rows.length === 0) {
       return res.status(404).json({ error: 'Queue not found.' });
@@ -89,7 +88,6 @@ export async function replayDLQJobs(req, res, next) {
 
     await client.query('BEGIN');
 
-    // 2. Build target replay query
     let selectQuery;
     let queryParams;
 
@@ -144,7 +142,7 @@ export async function replayDLQJobs(req, res, next) {
     }
     await redisPipeline.exec();
 
-    // Re-enqueue into active Redis Queue
+    // 6. Re-enqueue into active Redis Queue
     await Promise.all(
       jobsToReplay.map((job) =>
         RedisQueue.enqueue(queue.name, {
@@ -152,7 +150,7 @@ export async function replayDLQJobs(req, res, next) {
           queueId,
           type: job.type,
           payload: job.payload,
-          priority: job.priority || 1,
+          priority: job.priority || 5,
           runAt: null,
         })
       )
