@@ -1,36 +1,60 @@
 import { pool } from '../../config/db.js';
 import cronParser from 'cron-parser';
+import { RedisQueue } from '../../queue/redisQueue.js';
+
 
 // Ingest a Single Job (Immediate, Delayed, or Scheduled)
 export async function createJob(req, res, next) {
-  const { queueId, type, payload = {}, priority = 1, delaySeconds, runAt } = req.body;
-
-  if (!queueId || !type) {
-    return res.status(400).json({ error: 'queueId and type are required' });
-  }
-
   try {
-    let calculatedRunAt = new Date();
-    let initialStatus = 'QUEUED';
+    const { queueId, type, payload = {}, priority = 1, runAt = null } = req.body;
 
-    if (delaySeconds) {
-      calculatedRunAt = new Date(Date.now() + delaySeconds * 1000);
-      initialStatus = 'SCHEDULED';
-    } else if (runAt) {
-      calculatedRunAt = new Date(runAt);
-      if (calculatedRunAt > new Date()) {
-        initialStatus = 'SCHEDULED';
-      }
+    if (!queueId || !type) {
+      return res.status(400).json({ error: 'queueId and type are required fields.' });
     }
 
-    const result = await pool.query(
-      `INSERT INTO jobs (queue_id, type, payload, priority, status, run_at)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
-      [queueId, type, payload, priority, initialStatus, calculatedRunAt]
+    // 1. Verify queue exists and get queue name
+    const queueResult = await pool.query(
+      'SELECT id, name, concurrency_limit FROM queues WHERE id = $1',
+      [queueId]
     );
 
-    res.status(201).json(result.rows[0]);
+    if (queueResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Target queue does not exist.' });
+    }
+
+    const queue = queueResult.rows[0];
+
+    // 2. Persist durably in PostgreSQL
+    const insertQuery = `
+      INSERT INTO jobs (queue_id, type, payload, priority, status, run_at)
+      VALUES ($1, $2, $3, $4, 'QUEUED', COALESCE($5, NOW()))
+      RETURNING id, queue_id, type, payload, priority, status, run_at, created_at;
+    `;
+
+    const result = await pool.query(insertQuery, [
+      queueId,
+      type,
+      JSON.stringify(payload),
+      priority,
+      runAt,
+    ]);
+
+    const createdJob = result.rows[0];
+
+    // 3. Push to Redis RAM Queue for microsecond dispatching
+    await RedisQueue.enqueue(queue.name, {
+      id: createdJob.id,          // Pass the exact Postgres UUID
+      queueId: createdJob.queue_id,
+      type: createdJob.type,
+      payload: createdJob.payload,
+      priority: createdJob.priority,
+      runAt: createdJob.run_at,
+    });
+
+    return res.status(202).json({
+      message: 'Job accepted and queued for execution.',
+      job: createdJob,
+    });
   } catch (error) {
     next(error);
   }
@@ -38,29 +62,70 @@ export async function createJob(req, res, next) {
 
 // Ingest Batch Jobs
 export async function createBatchJobs(req, res, next) {
-  const { queueId, jobs } = req.body; // jobs is an array: [{ type, payload, priority }]
-
-  if (!queueId || !Array.isArray(jobs) || jobs.length === 0) {
-    return res.status(400).json({ error: 'queueId and a non-empty jobs array are required' });
-  }
-
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const createdJobs = [];
+    const { queueId, jobs } = req.body;
 
-    for (const job of jobs) {
-      const res = await client.query(
-        `INSERT INTO jobs (queue_id, type, payload, priority, status)
-         VALUES ($1, $2, $3, $4, 'QUEUED')
-         RETURNING *`,
-        [queueId, job.type, job.payload || {}, job.priority || 1]
-      );
-      createdJobs.push(res.rows[0]);
+    if (!queueId || !Array.isArray(jobs) || jobs.length === 0) {
+      return res.status(400).json({ error: 'queueId and non-empty jobs array are required.' });
     }
 
+    // 1. Verify queue
+    const queueResult = await client.query(
+      'SELECT id, name FROM queues WHERE id = $1',
+      [queueId]
+    );
+
+    if (queueResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Queue not found.' });
+    }
+
+    const queueName = queueResult.rows[0].name;
+
+    await client.query('BEGIN');
+
+    // 2. Build multi-row parameterized query for PostgreSQL
+    const values = [];
+    const placeholders = jobs.map((job, idx) => {
+      const offset = idx * 5;
+      values.push(
+        queueId,
+        job.type,
+        JSON.stringify(job.payload || {}),
+        job.priority || 1,
+        job.runAt || null
+      );
+      return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, 'QUEUED', COALESCE($${offset + 5}, NOW()))`;
+    });
+
+    const insertQuery = `
+      INSERT INTO jobs (queue_id, type, payload, priority, status, run_at)
+      VALUES ${placeholders.join(', ')}
+      RETURNING id, queue_id, type, payload, priority, status, run_at;
+    `;
+
+    const { rows: insertedJobs } = await client.query(insertQuery, values);
     await client.query('COMMIT');
-    res.status(201).json({ count: createdJobs.length, jobs: createdJobs });
+
+    // 3. Batch push to Redis RAM in parallel
+    await Promise.all(
+      insertedJobs.map((job) =>
+        RedisQueue.enqueue(queueName, {
+          id: job.id,
+          queueId: job.queue_id,
+          type: job.type,
+          payload: job.payload,
+          priority: job.priority,
+          runAt: job.run_at,
+        })
+      )
+    );
+
+    return res.status(202).json({
+      message: `Successfully accepted batch of ${insertedJobs.length} jobs.`,
+      count: insertedJobs.length,
+      jobs: insertedJobs,
+    });
   } catch (error) {
     await client.query('ROLLBACK');
     next(error);

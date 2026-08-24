@@ -3,6 +3,8 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { pool } from '../config/db.js';
 import apiRoutes from './routes/apiRoutes.js';
+import dlqRoutes from './routes/dlqRoutes.js'
+import metricRoutes from './routes/metricRoutes.js'
 
 dotenv.config();
 
@@ -32,6 +34,13 @@ app.get('/api/health', async (req, res) => {
 
 // Mount Central API Routes
 app.use('/api/v1', apiRoutes);
+
+//Mount DLQ routes
+app.use('/api/v1/queues/:queueId/dlq', dlqRoutes);
+
+//Mount Metric Routes
+app.use('/api/v1/metrics', metricRoutes);
+app.use('/api/v1/queues/:queueId/metrics', metricRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint not found' });
