@@ -118,3 +118,176 @@ docker compose exec api npm test
 
 # Stop all containers and purge persistent volumes
 docker compose down -v
+
+
+# for these diagrams, plase copy and paste these mermaid codes at https://mermaid.ai/app/dashboard
+
+#System Architecture
+
+## 🏛️ System Architecture
+
+```mermaid
+flowchart TB
+    subgraph ClientLayer ["Client & Management Layer"]
+        UI["🖥️ React Dashboard UI (Port 3000)"]
+        CLI["💻 Evaluator Scripts / External Apps"]
+    end
+
+    subgraph APILayer ["API & Ingestion Service (Port 5000)"]
+        API["⚡ Express / Node.js REST Engine"]
+        AuthMid["🛡️ JWT Auth & Tenant Validation"]
+        RateLmt["⏱️ Rate Limiter"]
+        BatchIngest["📦 Batch Job Ingestion"]
+        API --> AuthMid --> RateLmt --> BatchIngest
+    end
+
+    subgraph MemoryLayer ["Fast Queuing & In-Memory State"]
+        Redis[("⚡ Redis 7 Engine (Port 6379)")]
+        ZSetReady["🗂️ Ready Queue (ZSET by priority/time)"]
+        ZSetDelay["⏰ Delayed Queue (ZSET run_at)"]
+        AtomicClaim["🔒 Atomic ZPOPMIN Claiming"]
+        Redis --- ZSetReady
+        Redis --- ZSetDelay
+        Redis --- AtomicClaim
+    end
+
+    subgraph PersistenceLayer ["Durable ACID Store"]
+        Postgres[("🐘 PostgreSQL 16 DB (Port 5432)")]
+        Tables["Organizations | Queues | Jobs | Executions | DLQ"]
+        Postgres --- Tables
+    end
+
+    subgraph WorkerLayer ["Autonomous Worker Fleet"]
+        W1["⚙️ Worker Node 1"]
+        W2["⚙️ Worker Node 2"]
+        WN["⚙️ Worker Node N (Scale 1..N)"]
+    end
+
+    UI -->|REST / SSE Telemetry| API
+    CLI -->|HTTP Requests| API
+
+    BatchIngest -->|Enqueue Tasks| Redis
+    BatchIngest -->|Durable Persistence| Postgres
+
+    W1 & W2 & WN -->|Atomic ZPOPMIN Poll| Redis
+    W1 & W2 & WN -->|State Transition & Telemetry| Postgres
+    W1 & W2 & WN -.->|Max Retries Exceeded -> DLQ| Postgres
+
+
+    # ER Diagram
+
+    ### 2. Entity-Relationship (ER) Diagram
+
+```markdown
+## 🗄️ Database Entity-Relationship (ER) Diagram
+
+```mermaid
+erDiagram
+    ORGANIZATIONS ||--o{ USERS : "has many"
+    ORGANIZATIONS ||--o{ PROJECTS : "owns"
+    ORGANIZATIONS ||--o{ RETRY_POLICIES : "defines"
+    PROJECTS ||--o{ QUEUES : "contains"
+    RETRY_POLICIES ||--o{ QUEUES : "applies to"
+    QUEUES ||--o{ JOBS : "holds"
+    JOBS ||--o{ JOB_EXECUTIONS : "records"
+    QUEUES ||--o{ DEAD_LETTER_QUEUE : "isolates failures"
+
+    ORGANIZATIONS {
+        uuid id PK
+        string name
+        timestamp created_at
+    }
+
+    USERS {
+        uuid id PK
+        uuid organization_id FK
+        string name
+        string email UK
+        string password_hash
+        string role
+        timestamp created_at
+    }
+
+    PROJECTS {
+        uuid id PK
+        uuid organization_id FK
+        string name
+        string slug
+        timestamp created_at
+    }
+
+    RETRY_POLICIES {
+        uuid id PK
+        uuid organization_id FK
+        uuid project_id FK
+        string name
+        string strategy
+        int max_retries
+        int base_delay_seconds
+        int initial_delay_ms
+        float backoff_multiplier
+        timestamp created_at
+    }
+
+    QUEUES {
+        uuid id PK
+        uuid project_id FK
+        uuid retry_policy_id FK
+        string name
+        int concurrency_limit
+        int priority
+        boolean is_paused
+        int rate_limit
+        int rate_limit_window_ms
+        timestamp created_at
+    }
+
+    JOBS {
+        uuid id PK
+        uuid queue_id FK
+        string type
+        jsonb payload
+        int priority
+        string status
+        int retry_count
+        int max_retries
+        timestamp run_at
+        string locked_by_worker_id
+        timestamp locked_at
+        timestamp started_at
+        timestamp completed_at
+        text error_message
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    JOB_EXECUTIONS {
+        uuid id PK
+        uuid job_id FK
+        string worker_id
+        int attempt_number
+        string status
+        int duration_ms
+        text error_message
+        timestamp started_at
+        timestamp finished_at
+    }
+
+    DEAD_LETTER_QUEUE {
+        uuid id PK
+        uuid job_id
+        uuid queue_id FK
+        text failed_reason
+        timestamp created_at
+    }
+
+    WORKERS {
+        string id PK
+        string worker_id
+        string hostname
+        int pid
+        string status
+        int current_jobs_count
+        timestamp last_heartbeat_at
+        timestamp created_at
+    }
