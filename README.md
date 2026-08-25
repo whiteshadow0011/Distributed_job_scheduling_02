@@ -24,8 +24,14 @@ cd Distributed_job_scheduling_02
 
 # Start all containers in detached mode
 docker compose up --build -d
-2. Verify Container HealthBashdocker compose ps
-ServicePortEndpoint / InterfaceWeb Dashboard UI3000http://localhost:3000REST API Engine5000http://localhost:5000PostgreSQL Database5432localhost:5432 (scheduler_db)Redis Cache & Queues6379localhost:6379🧪 Automated End-to-End Evaluation ScriptRun this single command in your terminal to automatically register a tenant, create a dynamic queue, ingest batch jobs, test DLQ failure retries, and fetch live metrics:Bashbash -c '
+
+
+### 2. Verify Container Health
+
+```bash
+docker compose ps
+
+bash -c '
 set -e
 echo "=========================================================="
 echo "  1. AUTHENTICATING & CREATING TENANT"
@@ -34,7 +40,7 @@ AUTH_RES=$(curl -s -X POST http://localhost:5000/api/v1/auth/register \
   -H "Content-Type: application/json" \
   -d "{\"organizationName\":\"Evaluation Org\",\"email\":\"evaluator@system.local\",\"password\":\"securePass123\"}")
 
-TOKEN=$(echo$AUTH_RES | grep -o "\"token\":\"[^\"]*" | cut -d"\"" -f4)
+TOKEN=$(echo "$AUTH_RES" | grep -o "\"token\":\"[^\"]*" | cut -d"\"" -f4)
 echo "JWT Token Acquired: ${TOKEN:0:28}..."
 
 echo ""
@@ -43,7 +49,7 @@ echo "  2. RETRIEVING DEFAULT PROJECT"
 echo "=========================================================="
 PROJ_RES=$(curl -s -X GET http://localhost:5000/api/v1/queues/projects \
   -H "Authorization: Bearer $TOKEN")
-PROJECT_ID=$(echo$PROJ_RES | grep -o "\"id\":\"[^\"]*" | head -n 1 | cut -d"\"" -f4)
+PROJECT_ID=$(echo "$PROJ_RES" | grep -o "\"id\":\"[^\"]*" | head -n 1 | cut -d"\"" -f4)
 echo "Project ID: $PROJECT_ID"
 
 echo ""
@@ -55,7 +61,7 @@ QUEUE_RES=$(curl -s -X POST http://localhost:5000/api/v1/queues \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d "{\"projectId\":\"$PROJECT_ID\",\"name\":\"$QUEUE_NAME\",\"concurrencyLimit\":20}")
-QUEUE_ID=$(echo$QUEUE_RES | grep -o "\"id\":\"[^\"]*" | head -n 1 | cut -d"\"" -f4)
+QUEUE_ID=$(echo "$QUEUE_RES" | grep -o "\"id\":\"[^\"]*" | head -n 1 | cut -d"\"" -f4)
 echo "Queue Created: $QUEUE_NAME ($QUEUE_ID)"
 
 echo ""
@@ -92,14 +98,23 @@ curl -s -X GET http://localhost:5000/api/v1/metrics/overview \
   -H "Authorization: Bearer $TOKEN"
 echo -e "\n\nEvaluation Complete."
 '
-⚙️ Operational CommandsLive Log StreamingBash# Stream worker task execution
+
+
+## ⚙️ Operational Commands
+
+### Live Log Streaming
+```bash
+# Stream worker task execution
 docker compose logs worker -f
 
 # Stream API logs
 docker compose logs api -f
-Scale Worker Nodes HorizontallyBash# Scale to 3 active worker instances
+
+# Scale to 3 active worker instances
 docker compose up --scale worker=3 -d
-Run Automated TestsBash# Execute unit & integration test suite
+
+# Execute unit & integration test suite
 docker compose exec api npm test
-Clean Teardown & ResetBash# Stop all containers and purge persistent volumes
+
+# Stop all containers and purge persistent volumes
 docker compose down -v
