@@ -119,6 +119,17 @@ docker compose exec api npm test
 # Stop all containers and purge persistent volumes
 docker compose down -v
 
+## Scaling Workers Horizontally
+
+The worker pool is completely stateless and utilizes Redis atomic locks and queue primitives to guarantee mutually exclusive job execution without duplicate processing.
+
+### Run with a Custom Number of Workers
+To scale out the worker fleet to $N$ instances (e.g., 3 or 5 nodes):
+
+```bash
+# Start the full stack with 3 parallel worker processes
+docker compose up -d --scale worker=3
+
 
 # for these diagrams, plase copy and paste these mermaid codes at https://mermaid.ai/app/dashboard
 
