@@ -9,7 +9,11 @@ export async function getGlobalOverviewMetrics(req, res, next) {
   try {
     const organizationId = req.user?.organization_id;
 
-    // 1. Fetch all queues belonging to this organization's projects
+    // 1. Fetch active workers count directly from live Redis heartbeats (immune to clock drift)
+    const workerKeys = await redis.keys('worker:heartbeat:*');
+    const activeWorkerCount = workerKeys.length;
+
+    // 2. Fetch all queues belonging to this organization's projects
     const queuesQuery = `
       SELECT q.id, q.name, q.concurrency_limit, q.is_paused, q.priority
       FROM queues q
@@ -28,7 +32,7 @@ export async function getGlobalOverviewMetrics(req, res, next) {
           totalPendingJobs: 0,
           totalDelayedJobs: 0,
           totalDeadLetterJobs: 0,
-          totalActiveWorkerNodes: 0,
+          totalActiveWorkerNodes: activeWorkerCount,
         },
         performance24h: {
           totalProcessed: 0,
@@ -43,7 +47,7 @@ export async function getGlobalOverviewMetrics(req, res, next) {
 
     const queueIds = queues.map((q) => q.id);
 
-    // 2. Fetch Live Redis RAM counts across all queues using a single pipeline
+    // 3. Fetch Live Redis RAM counts across all queues using a single pipeline
     const redisPipeline = redis.pipeline();
     for (const q of queues) {
       redisPipeline.zcard(`queue:${q.name}:pending`);
@@ -76,7 +80,7 @@ export async function getGlobalOverviewMetrics(req, res, next) {
       };
     });
 
-    // 3. PostgreSQL Aggregate Metrics across all organization queues
+    // 4. PostgreSQL Aggregate Metrics across all organization queues
     const statsQuery = `
       SELECT 
         COUNT(*) FILTER (WHERE je.status = 'SUCCESS') AS completed_24h,
@@ -88,18 +92,7 @@ export async function getGlobalOverviewMetrics(req, res, next) {
         AND je.started_at >= NOW() - INTERVAL '24 hours';
     `;
 
-    const activeWorkersQuery = `
-      SELECT COUNT(*) AS active_workers_count
-      FROM workers
-      WHERE status = 'ACTIVE' 
-        AND last_heartbeat_at >= NOW() - INTERVAL '30 seconds';
-    `;
-
-    const [statsResult, activeWorkersResult] = await Promise.all([
-      pool.query(statsQuery, [queueIds]),
-      pool.query(activeWorkersQuery),
-    ]);
-
+    const statsResult = await pool.query(statsQuery, [queueIds]);
     const stats = statsResult.rows[0];
     const completed24h = parseInt(stats.completed_24h || '0', 10);
     const failed24h = parseInt(stats.failed_24h || '0', 10);
@@ -114,7 +107,7 @@ export async function getGlobalOverviewMetrics(req, res, next) {
         totalPendingJobs: totalPending,
         totalDelayedJobs: totalDelayed,
         totalDeadLetterJobs: totalDlq,
-        totalActiveWorkerNodes: parseInt(activeWorkersResult.rows[0]?.active_workers_count || '0', 10),
+        totalActiveWorkerNodes: activeWorkerCount,
       },
       performance24h: {
         totalProcessed: totalProcessed24h,
@@ -151,12 +144,15 @@ export async function getQueueMetrics(req, res, next) {
 
     const queue = queueResult.rows[0];
 
-    const [pendingCount, delayedCount, dlqCount, activeWorkersRunning] = await Promise.all([
+    const [pendingCount, delayedCount, dlqCount, activeWorkersRunning, workerKeys] = await Promise.all([
       redis.zcard(`queue:${queue.name}:pending`),
       redis.zcard(`queue:${queue.name}:delayed`),
       redis.llen(`queue:${queue.name}:dlq`),
       redis.get(`queue:${queue.name}:active_count`),
+      redis.keys('worker:heartbeat:*'),
     ]);
+
+    const activeWorkerCount = workerKeys.length;
 
     const statsQuery = `
       SELECT 
@@ -168,13 +164,6 @@ export async function getQueueMetrics(req, res, next) {
       JOIN jobs j ON je.job_id = j.id
       WHERE j.queue_id = $1 
         AND je.started_at >= NOW() - INTERVAL '24 hours';
-    `;
-
-    const activeWorkersQuery = `
-      SELECT COUNT(*) AS active_workers_count
-      FROM workers
-      WHERE status = 'ACTIVE' 
-        AND last_heartbeat_at >= NOW() - INTERVAL '30 seconds';
     `;
 
     const timeSeriesQuery = `
@@ -198,9 +187,8 @@ export async function getQueueMetrics(req, res, next) {
       ORDER BY tb.bucket ASC;
     `;
 
-    const [statsResult, activeWorkersResult, timeSeriesResult] = await Promise.all([
+    const [statsResult, timeSeriesResult] = await Promise.all([
       pool.query(statsQuery, [queueId]),
-      pool.query(activeWorkersQuery),
       pool.query(timeSeriesQuery, [queueId]),
     ]);
 
@@ -222,7 +210,7 @@ export async function getQueueMetrics(req, res, next) {
         delayedJobs: delayedCount,
         deadLetterJobs: dlqCount,
         activeInFlightJobs: parseInt(activeWorkersRunning || '0', 10),
-        activeWorkerNodes: parseInt(activeWorkersResult.rows[0]?.active_workers_count || '0', 10),
+        activeWorkerNodes: activeWorkerCount,
       },
       performance24h: {
         totalProcessed: totalProcessed24h,

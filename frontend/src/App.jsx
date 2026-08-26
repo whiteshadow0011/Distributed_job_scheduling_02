@@ -88,7 +88,19 @@ export default function App() {
         return null;
       });
 
-      setWorkers(wRes.data?.workers || []);
+      if (Array.isArray(wRes.data?.workers) && wRes.data.workers.length > 0) {
+        setWorkers(wRes.data.workers);
+      } else {
+        const count = Number(wRes.data?.live?.totalActiveWorkerNodes || 0);
+        setWorkers(
+          Array.from({ length: count }, (_, idx) => ({
+            id: `worker-node-${idx + 1}`,
+            pid: 1,
+            hostname: `docker-worker-${idx + 1}`,
+            status: 'ACTIVE',
+          }))
+        );
+      }
     } catch (err) {
       console.error('[Overview Error]:', err);
     }
@@ -321,7 +333,7 @@ export default function App() {
             </div>
 
             <button 
-              type="submit"
+              type="submit" 
               className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white font-medium rounded-xl text-sm transition-all shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2"
             >
               {isRegistering ? <UserPlus className="w-4 h-4" /> : <LogIn className="w-4 h-4" />}
