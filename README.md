@@ -302,3 +302,95 @@ erDiagram
         timestamp last_heartbeat_at
         timestamp created_at
     }
+
+
+
+
+## API Documentation
+
+All API endpoints are mounted under `/api/v1` and secured with Bearer Token authentication (`Authorization: Bearer <JWT>`), except registration and login.
+
+### 1. Authentication
+* **`POST /api/v1/auth/register`**
+  * **Payload:** `{ "name": "Admin", "email": "admin@domain.io", "password": "securepassword", "organizationName": "Acme Inc" }`
+  * **Response (201):** `{ "message": "User registered", "token": "<JWT_TOKEN>", "user": { ... } }`
+* **`POST /api/v1/auth/login`**
+  * **Payload:** `{ "email": "admin@domain.io", "password": "securepassword" }`
+  * **Response (200):** `{ "token": "<JWT_TOKEN>", "user": { ... } }`
+
+### 2. Queues & Projects
+* **`GET /api/v1/projects`**
+  * Fetches all projects belonging to the authenticated user's organization.
+* **`GET /api/v1/queues`**
+  * Fetches all active and paused queues under the organization.
+* **`POST /api/v1/queues`**
+  * **Payload:** `{ "projectId": "<UUID>", "name": "email-notifications", "concurrencyLimit": 10, "priority": 5 }`
+  * **Validation:** Validates unique queue name per project and valid concurrency ranges.
+* **`PATCH /api/v1/queues/:queueId/pause`**
+  * **Payload:** `{ "isPaused": true | false }`
+  * Pauses or resumes job dispatching on the target queue without affecting in-flight jobs.
+
+### 3. Job Dispatching, Filtering & Pagination
+* **`POST /api/v1/jobs`**
+  * Dispatches an individual job (immediate or delayed).
+  * **Payload:** 
+    ```json
+    {
+      "queueId": "<UUID>",
+      "type": "SEND_WELCOME_EMAIL",
+      "payload": { "email": "user@scale.io" },
+      "priority": 5,
+      "delaySeconds": 0
+    }
+    ```
+* **`POST /api/v1/jobs/batch`**
+  * Dispatches a batch of jobs in a single atomic transaction.
+  * **Payload:** `{ "queueId": "<UUID>", "jobs": [ { "type": "SEND_WELCOME_EMAIL", "payload": {}, "priority": 5 } ] }`
+* **`GET /api/v1/jobs`**
+  * **Query Params (Filtering & Pagination):**
+    * `queueId` *(UUID)*: Filter by target queue.
+    * `status` *(string)*: Filter by `QUEUED`, `RUNNING`, `COMPLETED`, or `DLQ`.
+    * `page` *(integer, default: 1)*: Page number.
+    * `limit` *(integer, default: 20)*: Number of jobs per page.
+  * **Response (200):** `{ "jobs": [ ... ], "pagination": { "total": 120, "page": 1, "limit": 20, "totalPages": 6 } }`
+
+### 4. DLQ Quarantine & Replay
+* **`GET /api/v1/queues/:queueId/dlq`**
+  * Retrieves exhausted/poison jobs quarantined in DLQ.
+* **`POST /api/v1/queues/:queueId/dlq/replay`**
+  * **Payload:** `{ "jobIds": ["<UUID>"] }`
+  * Moves specified jobs from DLQ back into the active pending queue.
+* **`POST /api/v1/queues/:queueId/dlq/replay-all`**
+  * Flushes all quarantined jobs in the DLQ back into the active queue.
+
+### 5. Telemetry & Metrics
+* **`GET /api/v1/metrics/overview`**
+  * Global metrics across the entire organization, live Redis queue depths, 24h execution aggregates, and active worker node counts.
+* **`GET /api/v1/queues/:queueId/metrics`**
+  * Single queue metrics including 24-hour hourly continuous throughput buckets (`timeSeries24h`).
+* **`GET /api/v1/queues/:queueId/stream`**
+  * Server-Sent Events (SSE) stream for real-time live metric telemetry.
+
+---
+
+## Design Decisions & Architectural Trade-offs
+
+### 1. Hybrid Storage Strategy (Redis RAM + PostgreSQL Persistence)
+* **Design:** High-speed queue operations (enqueue, lock acquisition, delayed scheduling) execute entirely in **Redis RAM data structures**, while persistent job histories, execution audit logs, and account metadata reside in **PostgreSQL**.
+* **Trade-off:** Pure PostgreSQL queues suffer from table lock contention and index bloat under high throughput. Pure Redis lacks transactional audit trails. The hybrid approach gives millisecond queue dispatching with durable database persistence.
+
+### 2. Atomic Job Claiming & Mutual Exclusion via Redis Lua Scripts
+* **Design:** Workers claim jobs using an atomic Lua script / Redis transaction (`ZPOPMIN` + `HSET` in-flight).
+* **Trade-off:** Polling with client-side locks creates race conditions between scaled worker nodes. Lua scripts execute atomically on the single-threaded Redis engine, guaranteeing that exactly one worker claims any given Job ID with zero duplicate executions.
+
+### 3. Concurrency Limits & Queue Throttling
+* **Design:** Concurrency limits are tracked in Redis using atomic counters (`queue:<name>:active_count`). Before a worker attempts to claim a job from a queue, it evaluates the active count against `concurrency_limit`.
+* **Trade-off:** Prevents slow downstream microservices and external APIs from getting overwhelmed during batch bursts without pausing other queues.
+
+### 4. Resilient Exponential Backoff & DLQ Isolation
+* **Design:** When a worker encounters an error during job execution, it increments `retry_count` and reschedules the job into a delayed Sorted Set using exponential backoff ($1500 \times 2^{\text{retries}}$ ms). Once `retry_count` exceeds `max_retries`, the job is removed from the active lifecycle and appended to the Dead Letter Queue (`queue:<name>:dlq`).
+* **Trade-off:** Prevents "poison pill" tasks from blocking queue processing, guarantees backpressure absorption, and enables manual inspection and redrive actions without data loss.
+
+### 5. Worker Heartbeats & Clock-Drift Immunity
+* **Design:** Active workers maintain an ephemeral Redis heartbeat key (`worker:heartbeat:<uuid>`) with a 15-second TTL.
+* **Trade-off:** SQL-based heartbeat queries relying on `NOW() - INTERVAL '30 seconds'` fail when container clocks drift across Docker hosts. Redis TTLs expire purely on key age, providing reliable live worker counts across dynamically scaled nodes.
